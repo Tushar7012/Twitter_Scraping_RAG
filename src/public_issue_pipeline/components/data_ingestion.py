@@ -8,9 +8,7 @@ class DataIngestion:
     def __init__(self, config: DataIngestionConfig):
         self.config = config
         load_dotenv()
-        # --- FIX: Corrected the environment variable name ---
         bearer_token = os.getenv("TWITTER_BEARER_TOKEN")
-        # ---------------------------------------------------
         if not bearer_token:
             raise ValueError("TWITTER_BEARER_TOKEN not found in .env file!")
         self.client = tweepy.Client(bearer_token)
@@ -34,7 +32,7 @@ class DataIngestion:
         query = f"conversation_id:{conversation_id} -is:retweet lang:en"
         response = self.client.search_recent_tweets(
             query=query,
-            max_results=100, # Fetch up to 100 replies per conversation
+            max_results=100, 
             tweet_fields=self.config.tweet_fields,
             user_fields=self.config.user_fields,
             expansions=["author_id"]
