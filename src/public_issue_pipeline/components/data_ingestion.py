@@ -21,7 +21,7 @@ class DataIngestion:
             max_results=self.config.max_results,
             tweet_fields=self.config.tweet_fields,
             user_fields=self.config.user_fields,
-            expansions=["author_id"]
+            expansions=["author_id","geo.place_id"]
         )
         print("Parent tweets fetched successfully.")
         return response
