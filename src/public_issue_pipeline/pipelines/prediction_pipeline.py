@@ -1,81 +1,79 @@
-import json
-from datetime import datetime
 from dataclasses import replace
 from public_issue_pipeline.config.configuration import ConfigurationManager
 from public_issue_pipeline.components.data_ingestion import DataIngestion
 from public_issue_pipeline.components.data_processing import DataProcessor
+from public_issue_pipeline.components.embedding_generation import EmbeddingGenerator
+from public_issue_pipeline.components.db_storage import DatabaseStorage
 from public_issue_pipeline.utils.common import clean_text
 
 class PredictionPipeline:
     def __init__(self):
         self.data_processor = DataProcessor()
-
-    def _process_tweet_data(self, tweet, users):
-        """Helper function to process a single tweet object and return a dictionary."""
-        author_info = users.get(tweet.author_id, {"username": "unknown"})
-        cleaned = clean_text(tweet.text)
-        sentiment = self.data_processor.get_sentiment(cleaned)
-        return {
-            "id": tweet.id,
-            "author": f"@{author_info.username}",
-            "timestamp": tweet.created_at.isoformat(),
-            "sentiment": sentiment['label'],
-            "score": sentiment['score'],
-            "likes": tweet.public_metrics['like_count'],
-            "text": tweet.text
-        }
+        self.embedding_generator = EmbeddingGenerator()
+        self.db_storage = DatabaseStorage()
 
     def run(self, keyword: str):
+        processed_ids = []  # List to store IDs of processed tweets
         try:
+            # 1. Setup Database
+            self.db_storage.connect()
+            self.db_storage.create_table()
+
+            # 2. Configure and run data ingestion
             config_manager = ConfigurationManager()
             data_ingestion_config = config_manager.get_data_ingestion_config()
-            
             new_query = f"{keyword} -is:retweet lang:en"
+            # Set a low number for testing to avoid hitting rate limits quickly
             data_ingestion_config = replace(data_ingestion_config, query=new_query, max_results=10)
-            
             data_ingestion = DataIngestion(config=data_ingestion_config)
 
+            # 3. Fetch Parent Tweets and Replies
             parent_response = data_ingestion.fetch_parent_tweets()
             if not parent_response.data:
                 print(f"No parent tweets found for the keyword: '{keyword}'")
-                return
+                return [] # Return an empty list if no tweets are found
 
-            all_results = []
-            parent_tweets = parent_response.data
+            all_tweets_to_process = list(parent_response.data)
             users = {user["id"]: user for user in parent_response.includes.get("users", [])}
-
-            print(f"\nProcessing {len(parent_tweets)} parent tweets and their replies...\n")
-            for parent_tweet in parent_tweets:
-                # Process the parent tweet
-                parent_data = self._process_tweet_data(parent_tweet, users)
-                
-                # Fetch and process its replies
-                parent_data["replies"] = []
+            
+            for parent_tweet in parent_response.data:
                 reply_response = data_ingestion.fetch_replies(parent_tweet.conversation_id)
-                
-                if reply_response.data:
+                if reply_response and reply_response.data:
+                    all_tweets_to_process.extend(reply_response.data)
                     reply_users = {user["id"]: user for user in reply_response.includes.get("users", [])}
-                    # Update the main users dictionary with any new users from replies
                     users.update(reply_users)
-                    
-                    for reply_tweet in reply_response.data:
-                        # Ensure we don't add the parent tweet again if it appears in replies
-                        if reply_tweet.id != parent_tweet.id:
-                            reply_data = self._process_tweet_data(reply_tweet, users)
-                            parent_data["replies"].append(reply_data)
+            
+            # 4. Process and Store each Tweet
+            print(f"\nProcessing and storing {len(all_tweets_to_process)} tweets...")
+            for tweet in all_tweets_to_process:
+                author_info = users.get(tweet.author_id, {"username": "unknown"})
+                cleaned = clean_text(tweet.text)
                 
-                all_results.append(parent_data)
+                if not cleaned: continue
 
-            # Save the structured data to a JSON file
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_keyword = "".join(c for c in keyword if c.isalnum() or c in (' ', '_')).rstrip().replace(' ', '_')
-            filename = f"{safe_keyword}_{timestamp}.json"
-            
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(all_results, f, indent=4, ensure_ascii=False)
-            
-            print(f"\n✅ Success! Saved conversations to '{filename}'")
+                sentiment = self.data_processor.get_sentiment(cleaned)
+                embedding = self.embedding_generator.generate_embedding(cleaned)
+
+                tweet_data = {
+                    "id": tweet.id,
+                    "author": f"@{author_info.username}",
+                    "timestamp": tweet.created_at,
+                    "text": tweet.text,
+                    "sentiment": sentiment['label'],
+                    "score": sentiment['score'],
+                    "likes": tweet.public_metrics['like_count'],
+                    "embedding": embedding.tolist()
+                }
+                
+                self.db_storage.insert_tweet(tweet_data)
+                processed_ids.append(tweet.id) # Add the ID to our list
+
+            print(f"\n✅ Success! Data has been stored in the PostgreSQL database.")
+            return processed_ids # Return the list of processed IDs
 
         except Exception as e:
             print(f"An error occurred in the pipeline: {e}")
             raise e
+        finally:
+            if self.db_storage and self.db_storage.connection:
+                self.db_storage.close()
